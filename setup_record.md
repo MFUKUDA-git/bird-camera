@@ -250,3 +250,247 @@ if __name__ == '__main__':
 python preview.py
 ```
 起動後、同一ネットワークのPCやスマホなどのブラウザから `http://<Raspberry PiのIPアドレス>:5000`（例: `http://birdcam.local:5000`）にアクセスしてカメラ映像を確認します。
+
+これまでの拡張内容を `setup_record.md` に追記するためのテキストを作成しました。
+
+既存の `setup_record.md` の末尾に、以下のMarkdownテキストをそのままコピー＆ペーストして追加してください。
+
+---
+
+## 5. システム監視とファン自動制御の構築
+
+CPU温度、CPU使用率、メモリ使用率を定期的に取得してCSVに記録し、温度に応じてファン（GPIO 14）を自動制御するバックグラウンドシステムを構築する。
+
+### 5.1. 追加ライブラリのインストール
+
+仮想環境（`venv`）を有効にした状態で、システム情報取得および後述のグラフ化に必要なライブラリをインストールする。
+
+```bash
+pip install psutil pandas matplotlib
+
+```
+
+### 5.2. 監視・制御スクリプト (`temp_monitor.py`)
+
+プロジェクトフォルダ内に `temp_monitor.py` を作成する。75℃でファンがON、60℃でOFFになるようヒステリシスを設けている。データは `system_stats.csv` に保存される。
+
+```python
+import time
+import csv
+import os
+import psutil
+from datetime import datetime
+from gpiozero import OutputDevice, CPUTemperature
+
+# ハードウェア設定
+FAN_PIN = 14
+fan = OutputDevice(FAN_PIN)
+cpu = CPUTemperature()
+
+# 設定値
+LOG_FILE = "/home/msofk/bird-camera/system_stats.csv"
+TEMP_ON = 75.0
+TEMP_OFF = 60.0
+CHECK_INTERVAL = 10
+
+def log_data(temp, cpu_percent, mem_percent, fan_is_on):
+    """CSV形式でデータを記録する関数"""
+    file_exists = os.path.isfile(LOG_FILE)
+    
+    with open(LOG_FILE, 'a', newline='') as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(['Timestamp', 'Temperature(C)', 'CPU(%)', 'Memory(%)', 'Fan_ON'])
+            
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        fan_status = 1 if fan_is_on else 0
+        writer.writerow([timestamp, f"{temp:.1f}", f"{cpu_percent:.1f}", f"{mem_percent:.1f}", fan_status])
+
+fan_is_on = False
+
+try:
+    while True:
+        current_temp = cpu.temperature
+        cpu_usage = psutil.cpu_percent(interval=None)
+        mem_usage = psutil.virtual_memory().percent
+        
+        # ファン制御
+        if current_temp >= TEMP_ON and not fan_is_on:
+            fan.on()
+            fan_is_on = True
+        elif current_temp <= TEMP_OFF and fan_is_on:
+            fan.off()
+            fan_is_on = False
+            
+        # データの記録
+        log_data(current_temp, cpu_usage, mem_usage, fan_is_on)
+        time.sleep(CHECK_INTERVAL)
+
+except KeyboardInterrupt:
+    fan.off()
+
+```
+
+### 5.3. OS起動時の自動実行設定 (systemd)
+
+Raspberry Pi起動時に監視スクリプトがバックグラウンドで自動実行されるようにする。
+
+1. サービスファイルの作成
+
+```bash
+sudo nano /etc/systemd/system/bird-fan.service
+
+```
+
+2. 以下の内容を記述して保存（仮想環境のPythonを指定）
+
+```ini
+[Unit]
+Description=Bird Camera CPU Fan and Temperature Monitor
+After=multi-user.target
+
+[Service]
+ExecStart=/home/msofk/bird-camera/venv/bin/python /home/msofk/bird-camera/temp_monitor.py
+WorkingDirectory=/home/msofk/bird-camera
+Restart=always
+User=msofk
+
+[Install]
+WantedBy=multi-user.target
+
+```
+
+3. サービスの有効化と起動
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable bird-fan.service
+sudo systemctl start bird-fan.service
+
+```
+
+---
+
+## 6. Webダッシュボードの構築
+
+プレビュー用スクリプトを拡張し、ライブカメラ映像とシステム負荷グラフ（CSVデータから生成）を同一ブラウザ画面で確認できる統合ダッシュボードを作成する。
+
+### 6.1. ダッシュボード用スクリプトへのアップデート (`preview.py`)
+
+既存の `preview.py` を以下のコードで上書きする。グラフはディスクに保存せず、メモリ上で生成してブラウザに直接配信する。
+
+```python
+import cv2
+import io
+import pandas as pd
+import matplotlib
+matplotlib.use('Agg') # GUIなし環境での描画設定
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from flask import Flask, Response, render_template_string, send_file
+from picamera2 import Picamera2
+
+app = Flask(__name__)
+picam2 = Picamera2()
+
+config = picam2.create_preview_configuration(main={"size": (640, 480)})
+picam2.configure(config)
+picam2.start()
+
+HTML_PAGE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Bird Camera Dashboard</title>
+    <style>
+        body { font-family: sans-serif; text-align: center; background-color: #f4f4f9; color: #333; }
+        .container { display: flex; justify-content: center; align-items: flex-start; gap: 20px; padding: 20px; flex-wrap: wrap; }
+        .box { background: white; padding: 15px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        h1 { margin-top: 20px; }
+        img { max-width: 100%; height: auto; border-radius: 5px; }
+    </style>
+</head>
+<body>
+    <h1>Bird Camera Dashboard</h1>
+    <div class="container">
+        <div class="box">
+            <h2>Live View</h2>
+            <img src="{{ url_for('video_feed') }}">
+        </div>
+        <div class="box">
+            <h2>System Status</h2>
+            <p style="font-size: 0.8em; color: gray;">※グラフは30秒ごとに自動更新されます</p>
+            <img id="graph" src="{{ url_for('system_graph') }}" style="width: 500px;">
+        </div>
+    </div>
+    <script>
+        setInterval(() => {
+            document.getElementById('graph').src = "{{ url_for('system_graph') }}?" + new Date().getTime();
+        }, 30000);
+    </script>
+</body>
+</html>
+"""
+
+def generate_frames():
+    while True:
+        frame = picam2.capture_array("main")
+        ret, buffer = cv2.imencode('.jpg', frame)
+        frame_bytes = buffer.tobytes()
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+
+@app.route('/')
+def index():
+    return render_template_string(HTML_PAGE)
+
+@app.route('/video_feed')
+def video_feed():
+    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route('/graph')
+def system_graph():
+    LOG_FILE = "/home/msofk/bird-camera/system_stats.csv"
+    try:
+        df = pd.read_csv(LOG_FILE)
+        df = df.tail(300) # 直近のデータのみ描画
+        df['Timestamp'] = pd.to_datetime(df['Timestamp'])
+        
+        fig, ax1 = plt.subplots(figsize=(7, 4))
+        
+        # 温度 (赤)
+        ax1.set_xlabel('Time')
+        ax1.set_ylabel('Temperature (C)', color='tab:red')
+        ax1.plot(df['Timestamp'], df['Temperature(C)'], color='tab:red')
+        ax1.tick_params(axis='y', labelcolor='tab:red')
+        
+        # CPU (青)
+        ax2 = ax1.twinx()  
+        ax2.set_ylabel('CPU Usage (%)', color='tab:blue')
+        ax2.plot(df['Timestamp'], df['CPU(%)'], color='tab:blue', alpha=0.5)
+        ax2.tick_params(axis='y', labelcolor='tab:blue')
+        
+        # ファン状態 (オレンジ背景)
+        if 'Fan_ON' in df.columns:
+            fan_on_periods = df[df['Fan_ON'] == 1]
+            for _, row in fan_on_periods.iterrows():
+                ax1.axvspan(row['Timestamp'], row['Timestamp'], color='orange', alpha=0.3)
+                
+        ax1.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+        fig.autofmt_xdate()
+        fig.tight_layout()
+        
+        img_buffer = io.BytesIO()
+        plt.savefig(img_buffer, format='png')
+        img_buffer.seek(0)
+        plt.close(fig)
+        
+        return send_file(img_buffer, mimetype='image/png')
+        
+    except Exception as e:
+        return f"Graph Generation Error: {e}", 500
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
+
+```
