@@ -1,0 +1,18 @@
+[Unit]
+Description=Birdcam streaming service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/birdcam/birdcam.env
+User=msofk
+WorkingDirectory=/home/msofk/bird-camera
+ExecStart=/home/msofk/bird-camera/venv/bin/python /home/msofk/bird-camera/birdcam_main.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
