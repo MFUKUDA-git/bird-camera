@@ -229,21 +229,23 @@ def create_ffmpeg_process(stream_key: str):
     youtube_url = YOUTUBE_URL_TEMPLATE.format(key=stream_key)
     cmd = [
         FFMPEG_PATH,
-        "-loglevel",
-        "warning",
+        "-loglevel", "warning",
         "-y",
-        "-thread_queue_size",
-        "4096",
-        "-f",
-        "h264",
-        "-i",
-        "-",
-        "-c:v",
-        "copy",
-        "-f",
-        "flv",
-        "-rtmp_live",
-        "live",
+        # --- 修正: 生のH.264映像にシステム時刻のタイムスタンプを付与し、FPSを明示 ---
+        "-use_wallclock_as_timestamps", "1",
+        "-thread_queue_size", "4096",
+        "-f", "h264",
+        "-framerate", "30",
+        "-i", "-",
+        # --- 修正: 音声入力側にもスレッドキューを設定して同期遅れを防止 ---
+        "-f", "lavfi",
+        "-thread_queue_size", "4096",
+        "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-f", "flv",
+        "-rtmp_live", "live",
         youtube_url,
     ]
     proc = subprocess.Popen(
